@@ -1,0 +1,971 @@
+"""
+LLM-guided anomaly annotation pipeline.
+
+Implements:
+  - TASK_CONTEXT: per-dataset anomaly criterion definitions
+  - LLMAnnotator: pluggable LLM backend (Gemini API, OpenAI API, local GGUF via llama-cpp)
+  - select_samples: score-guided or random sample selection
+  - run_llm_active_loop: full pipeline (DeepSVDD -> LLM annotation -> SetFit -> DeepSAD)
+
+Backend options:
+  - "llamacpp" : Local quantized model via llama-cpp-python (default, no API key needed)
+                 pip install llama-cpp-python
+                 Recommended model: Qwen2.5-7B-Instruct Q4_K_M (~4.7 GB)
+  - "openai"   : OpenAI gpt-4o-mini
+                 pip install openai
+  - "gemini"   : Google Gemini (free tier may be unavailable in some regions e.g. Brazil)
+                 pip install google-genai
+
+Usage example:
+  annotator = LLMAnnotator(backend="gemini", api_key="YOUR_KEY")
+  results = annotator.annotate_batch(texts, dataset_name="told_br")
+"""
+
+import json
+import os
+import re
+import time
+from tqdm import tqdm
+import warnings
+from typing import Literal, Optional
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+# ---------------------------------------------------------------------------
+# Task context — anomaly criterion per dataset
+# ---------------------------------------------------------------------------
+
+TASK_CONTEXT = {
+    "hatebr": {
+        "description": (
+            "Brazilian Portuguese Instagram comments about politicians. "
+            "Your task: decide if a comment is OFFENSIVE (anomalous, score 1.0) or NOT OFFENSIVE (normal, score 0.0)."
+        ),
+        "normal_description": (
+            "Comments that express opinions, criticism, or disagreement WITHOUT attacking a person: "
+            "political criticism, factual statements, neutral or positive opinions, sarcasm without insults — all normal (score 0.0). "
+            "Brazilian Portuguese is expressive; mild informality or strong political opinions are NOT offensive."
+        ),
+        "anomaly_criterion": (
+            "Comments that a content moderator would flag as offensive, including: "
+            "(1) direct insults or personal attacks on a person ('idiota', 'vagabundo', 'incompetente miserável'); "
+            "(2) hate speech targeting groups by race, gender, religion, sexual orientation, or nationality; "
+            "(3) homophobia, sexism, racism, xenophobia, or religious intolerance — even in indirect or ironic form; "
+            "(4) apologies for the dictatorship or content promoting political violence. "
+            "Score >= 0.5 when the comment is clearly offensive. "
+            "Harsh but non-offensive political criticism = score 0.0. "
+            "When uncertain, prefer 0.2 (lean non-offensive)."
+        ),
+    },
+    "told_br": {
+        "description": (
+            "Brazilian Portuguese social media texts. "
+            "Your task: decide if a text contains OFFENSIVE/TOXIC content (anomalous, score 1.0) "
+            "or is acceptable (normal, score 0.0)."
+        ),
+        "normal_description": (
+            "Texts that, despite being informal or expressive, are NOT intentionally attacking a specific target: "
+            "exclamatory profanity without attack intent ('ai que pqp', 'caralho que legal'), "
+            "casual humor, mild stereotypes used conversationally without malicious intent, "
+            "strong political opinions, self-deprecation, and arguments without direct personal insults — "
+            "all normal (score 0.0). Brazilian Portuguese is naturally expressive with informal language."
+        ),
+        "anomaly_criterion": (
+            "Text that a Brazilian content moderator would flag as toxic/offensive, covering five categories: "
+            "(1) INSULT — direct personal attacks on a specific person ('você é um idiota', 'cala a boca', 'campanha bloqueie um idiota'); "
+            "(2) OBSCENE — sexually explicit or graphic content used to demean or shock ('putinha do anal', sexual acts described to insult); "
+            "(3) LGBTQphobia — slurs or attacks on LGBTQ+ people ('viado', 'sapatão' used as insults, not neutral references); "
+            "(4) MISOGYNY / RACISM / XENOPHOBIA — attacks degrading people by gender, race, ethnicity, or origin; "
+            "(5) THREATS — explicit or implicit threats of harm toward a person or group. "
+            "KEY DISTINCTION — profanity is common in Brazilian informal speech and is NOT sufficient alone: "
+            "'ai que pqp', 'caralho que legal', 'que merda' = expressive, NOT toxic (score 0.0). "
+            "Toxic content combines offensive vocabulary WITH intent to demean a target OR sexually explicit degradation. "
+            "Vague political criticism, mild rants, casual stereotypes, self-deprecation = score 0.0. "
+            "Score >= 0.5 when text clearly fits categories (1)-(5). When uncertain, prefer 0.2 (lean normal)."
+        ),
+    },
+    "tweets_hs": {
+        "description": (
+            "English tweets. "
+            "Your task: decide if a tweet contains HATE SPEECH (anomalous, score 1.0) or not (normal, score 0.0)."
+        ),
+        "normal_description": (
+            "Tweets that do NOT attack people based on group identity: "
+            "opinions, arguments, profanity, personal conflicts between individuals, "
+            "offensive language with no identity group target — all normal (score 0.0)."
+        ),
+        "anomaly_criterion": (
+            "Tweets that attack, degrade, or dehumanize people because of their race, ethnicity, gender, "
+            "sexual orientation, religion, nationality, or disability. "
+            "IMPORTANT — hate speech is often implicit or coded: "
+            "score >= 0.5 for tweets using irony or sarcasm to mock a group, "
+            "derogatory generalizations about a group presented as facts, "
+            "coded language or slurs (even softened or misspelled) targeting an identity group, "
+            "and content that dehumanizes or calls for exclusion of a group. "
+            "Score 0.0 only when the tweet targets a specific individual with no group-identity dimension, "
+            "or contains no attack at all. When in doubt about implicit hate, prefer 0.5."
+        ),
+    },
+    "pt_tweets": {
+        "description": (
+            "Brazilian Portuguese tweets. "
+            "Your task: classify the tweet's sentiment. "
+            "Positive sentiment = anomalous (score 1.0). Negative sentiment = normal (score 0.0)."
+        ),
+        "normal_description": (
+            "Tweets expressing negative sentiment: complaints, criticism, dissatisfaction, sadness, anger."
+        ),
+        "anomaly_criterion": (
+            "Tweets expressing positive sentiment: happiness, praise, excitement, satisfaction, gratitude. "
+            "Score 1.0 for positive tweets, 0.0 for negative tweets. "
+            "For neutral or ambiguous tweets, lean towards 0.0."
+        ),
+    },
+    "tweeteval": {
+        "description": (
+            "English tweets. "
+            "Your task: classify the tweet's sentiment. "
+            "Neutral = normal (score 0.0). Positive or negative = anomalous (score 1.0)."
+        ),
+        "normal_description": (
+            "Tweets with neutral sentiment: factual statements, questions, observations "
+            "without a positive or negative emotional lean."
+        ),
+        "anomaly_criterion": (
+            "Tweets with any sentiment polarity — positive (praise, excitement, happiness, gratitude) "
+            "or negative (criticism, anger, sadness, sarcasm, complaints). "
+            "Score 1.0 if the tweet expresses an emotion in either direction, even mildly. "
+            "Score 0.0 only if the tweet is genuinely neutral with no sentiment lean."
+        ),
+    },
+    "20_newsgroups": {
+        "description": (
+            "English newsgroup posts. "
+            "Your task: decide if a post belongs to the rec.sport.hockey newsgroup (normal, score 0.0) "
+            "or to any other newsgroup topic (anomalous, score 1.0)."
+        ),
+        "normal_description": (
+            "Posts about ice hockey: game scores, player trades, team standings, NHL news and commentary, "
+            "hockey equipment, rules, strategy, playoff discussions, or any other ice hockey topic."
+        ),
+        "anomaly_criterion": (
+            "Posts about any topic other than ice hockey: computers and software, science, politics, "
+            "religion, automobiles, space, medicine, history, philosophy, sports other than hockey, "
+            "or any other non-hockey subject. Score 1.0 for any non-hockey post."
+        ),
+    },
+    "wikinews": {
+        "description": (
+            "Portuguese WikiNews articles from multiple topic sections. "
+            "Your task is to classify whether an article belongs to the Politics (Política) section "
+            "or to some other section (health, sports, science, culture, technology, environment). "
+            "Politics = score 0.0. Any other section = score 1.0. "
+            "IMPORTANT: The vast majority of articles you will see are from Politics — "
+            "most articles should receive score 0.0. A score of 1.0 should be the exception, "
+            "reserved only for articles whose primary topic is clearly non-political."
+        ),
+        "normal_description": (
+            "News articles whose PRIMARY topic is political — ANY political topic from ANY country. "
+            "This includes: elections, government decisions, coups, diplomacy, international relations, "
+            "military conflicts and war reporting, political parties, legislation, political figures, "
+            "press freedom, geopolitical crises, and economic policy decisions made by governments. "
+            "The article does NOT need to be about Brazil or Portugal — politics worldwide counts as normal (0.0). "
+            "An article about a health crisis, economy, or science that is primarily framed as a "
+            "GOVERNMENT DECISION or POLITICAL ACTION is still Politics and scores 0.0. "
+            "When in doubt, default to 0.0."
+        ),
+        "anomaly_criterion": (
+            "News articles whose PRIMARY topic is clearly NOT political: "
+            "pure health/medicine news (disease outbreaks, medical treatments, epidemics), "
+            "pure sports results, pure culture/entertainment, pure science/technology discoveries, "
+            "pure environment/agriculture topics. "
+            "Score 1.0 ONLY when the article is unambiguously about one of these non-political domains "
+            "AND contains no significant political angle. "
+            "Elections, wars, diplomatic relations, court rulings on political matters, "
+            "government policies — all of these are Politics (score 0.0), regardless of how dramatic they are. "
+            "The fact that an event is important, historic, or controversial does NOT make it anomalous — "
+            "score is based purely on topic section, not on newsworthiness."
+        ),
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
+
+PROMPT_TEMPLATE = """\
+You are evaluating a text sample for anomaly detection.
+
+Dataset context: {description}
+
+Normal samples are: {normal_description}
+
+Anomaly criterion (use this definition strictly):
+{anomaly_criterion}
+
+Rate the following text on a scale from 0.0 (clearly normal) to 1.0 (clearly anomalous \
+according to the criterion above). Do not use any other notion of "anomalous".
+
+Text:
+\"\"\"
+{text}
+\"\"\"
+
+Respond ONLY with a JSON object, no explanation outside the JSON:
+{{"anomaly_score": <float between 0.0 and 1.0>, "reason": "<one sentence explaining your score>"}}
+"""
+
+
+def build_prompt(text: str, dataset_name: str) -> str:
+    """Build a fully formatted annotation prompt for a given text and dataset."""
+    if dataset_name not in TASK_CONTEXT:
+        raise ValueError(
+            f"Unknown dataset '{dataset_name}'. "
+            f"Available: {list(TASK_CONTEXT.keys())}"
+        )
+    ctx = TASK_CONTEXT[dataset_name]
+    return PROMPT_TEMPLATE.format(text=text, **ctx)
+
+
+def parse_llm_response(response_text: str) -> dict:
+    """
+    Parse LLM response into {'anomaly_score': float, 'reason': str}.
+    Handles common formatting issues (markdown code blocks, extra text).
+    Returns {'anomaly_score': None, 'reason': response_text} on failure.
+    """
+    # Strip markdown code fences if present
+    cleaned = re.sub(r"```(?:json)?", "", response_text).strip()
+    # Extract first JSON object
+    match = re.search(r"\{.*?\}", cleaned, re.DOTALL)
+    if not match:
+        return {"anomaly_score": None, "reason": response_text}
+    try:
+        parsed = json.loads(match.group())
+        score = float(parsed.get("anomaly_score", -1))
+        if not 0.0 <= score <= 1.0:
+            return {"anomaly_score": None, "reason": response_text}
+        return {"anomaly_score": score, "reason": parsed.get("reason", "")}
+    except (json.JSONDecodeError, ValueError):
+        return {"anomaly_score": None, "reason": response_text}
+
+
+# ---------------------------------------------------------------------------
+# LLM Annotator — pluggable backend
+# ---------------------------------------------------------------------------
+
+class LLMAnnotator:
+    """
+    LLM-based text annotator with pluggable backends.
+
+    Backends:
+        "gemini"   — Google Gemini 2.0 Flash via google-genai SDK
+        "openai"   — OpenAI gpt-4o-mini via openai SDK
+        "llamacpp" — Local GGUF model via llama-cpp-python (CPU inference)
+
+    Args:
+        backend: One of "gemini", "openai", "llamacpp".
+        api_key: API key for gemini/openai (or set via env var).
+        model: Model name/path override.
+                gemini default  : "gemini-2.0-flash"
+                openai default  : "gpt-4o-mini"
+                llamacpp default: path must be provided explicitly
+        llamacpp_kwargs: Extra kwargs passed to llama_cpp.Llama (e.g. n_ctx, n_threads).
+        retry_delay: Seconds to wait between retries on API errors.
+        max_retries: Max retries per sample.
+    """
+
+    BACKEND_DEFAULTS = {
+        "gemini"  : "gemini-2.5-flash-lite",    # free: ~1500 req/day, 1M TPM — Brazil supported
+        "openai"  : "gpt-4o-mini",
+        "llamacpp": None,                         # path must be provided
+    }
+
+    def __init__(
+        self,
+        backend: Literal["gemini", "openai", "llamacpp"] = "llamacpp",
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        llamacpp_kwargs: Optional[dict] = None,
+        retry_delay: float = 2.0,
+        max_retries: int = 3,
+    ):
+        if backend not in self.BACKEND_DEFAULTS:
+            raise ValueError(f"backend must be one of {list(self.BACKEND_DEFAULTS)}")
+
+        self.backend = backend
+        self.retry_delay = retry_delay
+        self.max_retries = max_retries
+        self.model = model or self.BACKEND_DEFAULTS[backend]
+        self._client = None
+
+        # Lazy init — actual import happens here to avoid hard dependency
+        if backend == "groq":
+            self._init_groq(api_key)
+        elif backend == "gemini":
+            self._init_gemini(api_key)
+        elif backend == "openai":
+            self._init_openai(api_key)
+        elif backend == "llamacpp":
+            self._init_llamacpp(llamacpp_kwargs or {})
+
+    # --- backend init ---
+
+    @staticmethod
+    def _load_dotenv():
+        """Load .env from project root if python-dotenv is available."""
+        try:
+            from dotenv import load_dotenv, find_dotenv
+            # find_dotenv() searches up the directory tree — works regardless of cwd
+            dotenv_path = find_dotenv(usecwd=True)
+            load_dotenv(dotenv_path, override=False)
+        except ImportError:
+            pass  # python-dotenv is optional
+
+    def _init_groq(self, api_key):
+        self._load_dotenv()
+        try:
+            from groq import Groq
+        except ImportError:
+            raise ImportError("Install groq: pip install groq")
+        import os
+        key = api_key or os.environ.get("GROQ_API_KEY")
+        if not key:
+            raise ValueError("Provide api_key or set GROQ_API_KEY env var (or add to .env)")
+        self._client = Groq(api_key=key)
+
+    def _init_gemini(self, api_key):
+        self._load_dotenv()
+        try:
+            from google import genai
+        except ImportError:
+            raise ImportError("Install google-genai: pip install google-genai")
+        import os
+        key = api_key or os.environ.get("GEMINI_API_KEY")
+        if not key:
+            raise ValueError("Provide api_key or set GEMINI_API_KEY env var (or add to .env)")
+        self._client = genai.Client(api_key=key)
+
+    def _init_openai(self, api_key):
+        self._load_dotenv()
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("Install openai: pip install openai")
+        import os
+        key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise ValueError("Provide api_key or set OPENAI_API_KEY env var (or add to .env)")
+        self._client = OpenAI(api_key=key)
+
+    def _init_llamacpp(self, llamacpp_kwargs):
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            raise ImportError(
+                "Install llama-cpp-python: pip install llama-cpp-python\n"
+                "Recommended model: Qwen2.5-7B-Instruct-Q4_K_M.gguf (~4.7GB)\n"
+                "Download from: https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF"
+            )
+        if not self.model:
+            raise ValueError("Provide model path for llamacpp backend, e.g. model='/path/to/model.gguf'")
+        # n_gpu_layers=-1 offloads all layers to GPU; set 0 for CPU-only
+        defaults = {"n_ctx": 8192, "n_threads": 4, "n_gpu_layers": -1, "verbose": False}
+        defaults.update(llamacpp_kwargs)
+        self._client = Llama(model_path=self.model, **defaults)
+
+    # --- single sample annotation ---
+
+    def _call_groq(self, prompt: str) -> str:
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        return response.choices[0].message.content
+
+    def _call_gemini(self, prompt: str) -> str:
+        from google.genai import types
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0,
+            ),
+        )
+        return response.text
+
+    def _call_openai(self, prompt: str) -> str:
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        return response.choices[0].message.content
+
+    def _truncate_for_llamacpp(self, text: str, dataset_name: str) -> tuple:
+        """Truncate text so the full prompt fits within n_ctx - 300 tokens.
+        Returns (text, truncated: bool).
+        """
+        max_prompt_tokens = self._client.n_ctx() - 300  # reserve 300 for response
+        full_prompt = build_prompt(text, dataset_name)
+        tokens = self._client.tokenize(full_prompt.encode())
+        if len(tokens) <= max_prompt_tokens:
+            return text, False
+        # Measure overhead from the template (empty text)
+        template_tokens = self._client.tokenize(build_prompt("", dataset_name).encode())
+        text_budget = max_prompt_tokens - len(template_tokens)
+        if text_budget <= 0:
+            return text[:200], True  # safety fallback
+        text_tokens = self._client.tokenize(text.encode())
+        if len(text_tokens) > text_budget:
+            text_tokens = text_tokens[:text_budget]
+            text = self._client.detokenize(text_tokens).decode("utf-8", errors="replace")
+        return text, True
+
+    def _call_llamacpp(self, prompt: str) -> str:
+        response = self._client.create_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+            temperature=0.0,
+        )
+        return response["choices"][0]["message"]["content"].strip()
+
+    def annotate(self, text: str, dataset_name: str) -> dict:
+        """
+        Annotate a single text sample.
+
+        Returns:
+            dict with keys:
+                'anomaly_score' : float in [0, 1] or None if parsing failed
+                'reason'        : str (LLM's explanation)
+                'parse_error'   : bool
+        """
+        truncated = False
+        if self.backend == "llamacpp":
+            text, truncated = self._truncate_for_llamacpp(text, dataset_name)
+        prompt = build_prompt(text, dataset_name)
+        raw = None
+        for attempt in range(self.max_retries):
+            try:
+                if self.backend == "groq":
+                    raw = self._call_groq(prompt)
+                elif self.backend == "gemini":
+                    raw = self._call_gemini(prompt)
+                elif self.backend == "openai":
+                    raw = self._call_openai(prompt)
+                elif self.backend == "llamacpp":
+                    raw = self._call_llamacpp(prompt)
+                break
+            except Exception as exc:
+                warnings.warn(f"LLM call failed (attempt {attempt+1}/{self.max_retries}): {exc}")
+                if attempt < self.max_retries - 1:
+                    # Parse wait time from Groq 429 error messages
+                    wait = self.retry_delay
+                    exc_str = str(exc)
+                    import re as _re
+                    # Format 1: 'retryDelay': '17s'
+                    m = _re.search(r"'retryDelay':\s*'([0-9.]+)s'", exc_str)
+                    if m:
+                        wait = float(m.group(1)) + 2.0
+                    else:
+                        # Format 2: "try again in 1m56.64s" or "try again in 47.3s"
+                        m2 = _re.search(r"try again in (?:(\d+)m)?([0-9.]+)s", exc_str)
+                        if m2:
+                            mins = float(m2.group(1) or 0)
+                            secs = float(m2.group(2))
+                            wait = mins * 60 + secs + 2.0
+                    print(f"  [rate limit] waiting {wait:.0f}s before retry...", flush=True)
+                    time.sleep(wait)
+                else:
+                    return {"anomaly_score": None, "reason": str(exc)[:200], "parse_error": True, "truncated": truncated}
+
+        result = parse_llm_response(raw)
+        result["parse_error"] = result["anomaly_score"] is None
+        result["truncated"] = truncated
+        return result
+
+    def annotate_batch(
+        self,
+        texts: list,
+        dataset_name: str,
+        verbose: bool = True,
+        delay: float = 0.0,
+    ) -> list:
+        """
+        Annotate a list of texts. Returns list of dicts (same as annotate()).
+
+        Args:
+            texts: List of raw text strings.
+            dataset_name: Key in TASK_CONTEXT.
+            verbose: Print progress.
+            delay: Seconds to wait between API calls (rate limiting).
+        """
+        results = []
+        n = len(texts)
+        for i, text in enumerate(texts):
+            result = self.annotate(text, dataset_name)
+            results.append(result)
+            if verbose and (i + 1) % max(1, n // 4) == 0:
+                n_errors = sum(1 for r in results if r["parse_error"])
+                print(f"  [{i+1}/{n}] parse_errors={n_errors}", flush=True)
+            if delay > 0:
+                time.sleep(delay)
+        if verbose:
+            n_failed = sum(1 for r in results if r["parse_error"])
+            print(f"  Done. {n - n_failed}/{n} parsed successfully.")
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Sample selection
+# ---------------------------------------------------------------------------
+
+def select_samples(
+    indices: np.ndarray,
+    scores: np.ndarray,
+    n: int,
+    strategy: Literal["random", "score_guided", "diversity"] = "score_guided",
+    random_state: int = 42,
+    embeddings: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Select N sample indices for LLM annotation.
+
+    Args:
+        indices: Array of available sample indices (into the full training pool).
+        scores: Anomaly scores for each sample in `indices` (from unsupervised model).
+        n: Number of samples to select.
+        strategy:
+            "score_guided" — select the n samples with the highest anomaly scores.
+            "random"       — select n samples uniformly at random.
+            "diversity"    — cluster embeddings into n groups (k-means++) and pick
+                             the sample closest to each centroid. Maximises coverage
+                             of the embedding space with the annotation budget.
+        random_state: Seed for random and diversity strategies.
+        embeddings: Embedding matrix aligned with `indices` (required for diversity).
+
+    Returns:
+        selected: Array of n indices.
+    """
+    n = min(n, len(indices))
+    if strategy == "score_guided":
+        order = np.argsort(scores)[::-1]  # highest scores first
+        return indices[order[:n]]
+    elif strategy == "random":
+        rng = np.random.default_rng(random_state)
+        chosen = rng.choice(len(indices), size=n, replace=False)
+        return indices[chosen]
+    elif strategy == "diversity":
+        if embeddings is None:
+            raise ValueError("strategy='diversity' requires embeddings to be provided.")
+        from sklearn.cluster import KMeans
+        embs = embeddings[indices]
+        km = KMeans(n_clusters=n, init="k-means++", n_init=1, random_state=random_state)
+        km.fit(embs)
+        # For each cluster pick the sample closest to its centroid
+        chosen = []
+        for c in range(n):
+            cluster_mask = km.labels_ == c
+            if not cluster_mask.any():
+                continue
+            cluster_pos = np.where(cluster_mask)[0]
+            dists = np.linalg.norm(embs[cluster_pos] - km.cluster_centers_[c], axis=1)
+            chosen.append(cluster_pos[np.argmin(dists)])
+        return indices[np.array(chosen)]
+    else:
+        raise ValueError(f"strategy must be 'score_guided', 'random', or 'diversity', got '{strategy}'")
+
+
+# ---------------------------------------------------------------------------
+# Full active loop
+# ---------------------------------------------------------------------------
+
+def run_llm_active_loop(
+    texts: np.ndarray,
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    dataset_name: str,
+    annotator: LLMAnnotator,
+    unsup_model_cls,
+    semisup_model_cls,
+    setfit_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    strategy: Literal["random", "score_guided", "diversity"] = "score_guided",
+    n_llm_calls: int = 100,
+    anomaly_score_threshold: float = 0.6,
+    min_anomalies_required: int = 20,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    device: str = "cpu",
+    verbose: bool = True,
+    load_labels_from: Optional[str] = None,
+    load_labels_model: Optional[str] = None,
+    no_setfit: bool = False,
+) -> dict:
+    """
+    Full LLM-guided anomaly detection pipeline (no human labels used in training).
+
+    Pipeline:
+        1. Train/test split (labels used ONLY for final evaluation).
+        2. Run unsupervised model (e.g. DeepSVDD) on train embeddings -> anomaly scores.
+        3. Select n_llm_calls samples (random, score-guided, or diversity).
+        4. Query LLM -> get anomaly_score per sample.
+        5. Convert LLM scores to binary labels via threshold.
+        6. Check: if fewer than min_anomalies_required labeled anomalies, warn and continue.
+        7. Fine-tune SetFit on LLM-labeled samples.
+        8. Re-encode train + test with SetFit embeddings.
+        9. Train semi-supervised model (e.g. DeepSAD) on LLM labels + SetFit embeddings.
+        10. Evaluate on test set -> return metrics.
+
+    Args:
+        texts: Raw text array (full dataset, pre-split).
+        embeddings: Pre-computed embeddings (N x D).
+        labels: Ground-truth binary labels (0=normal, 1=anomaly). Used ONLY for
+                diagnostic metrics (LLM agreement, train AUC) — never for training.
+        dataset_name: Key in TASK_CONTEXT (for prompt building).
+        annotator: Initialized LLMAnnotator instance.
+        unsup_model_cls: Class for the unsupervised AD model (e.g. deepod.models.DeepSVDD).
+        semisup_model_cls: Class for the semi-supervised AD model (e.g. deepod.models.DeepSAD).
+        setfit_model_name: SetFit base model for contrastive fine-tuning.
+        strategy: Sample selection strategy ("random", "score_guided", or "diversity").
+        n_llm_calls: Budget of LLM annotation calls.
+        anomaly_score_threshold: LLM scores >= threshold -> label as anomaly (1).
+        min_anomalies_required: Minimum anomaly labels needed to proceed; warns if not met.
+        test_size: Fraction of data held out for evaluation.
+        random_state: Reproducibility seed.
+        verbose: Print progress at each step.
+        load_labels_from: Path to an existing *_llm_labels.csv to skip LLM annotation
+            entirely (ablation mode). Only rows matching `random_state` are used.
+        load_labels_model: Model tag (e.g. 'qwen2.5-14b') used to filter the labels
+            file when it contains runs from multiple models. Requires a companion
+            metrics CSV in the same directory (same name without '_llm_labels').
+            If None, all rows matching `random_state` are used (old behaviour).
+        no_setfit: If True, skip SetFit fine-tuning and use the original pre-computed
+            embeddings directly for the semi-supervised model.
+
+    Returns:
+        dict with keys:
+            'roc_auc'           : float
+            'pr_auc'            : float
+            'n_llm_labeled'     : int (total LLM-labeled samples)
+            'n_anomalies_found' : int (samples labeled as anomaly by LLM)
+            'n_normals_found'   : int
+            'n_parse_errors'    : int
+            'strategy'          : str
+            'n_llm_calls'       : int
+            'dataset'           : str
+            'llm_labels_df'     : pd.DataFrame (index, text, llm_score, llm_label, reason)
+    """
+    from setfit import SetFitModel, SetFitTrainer
+    from datasets import Dataset as HFDataset
+
+    # ------------------------------------------------------------------
+    # Step 1 — Train / test split (labels not used in training)
+    # ------------------------------------------------------------------
+    indices = np.arange(len(texts))
+    # We split indices only; ground-truth labels passed in for eval only
+    train_idx, test_idx = train_test_split(
+        indices, test_size=test_size, random_state=random_state
+    )
+
+    X_train = embeddings[train_idx]
+    X_test = embeddings[test_idx]
+    texts_train = texts[train_idx]
+    texts_test = texts[test_idx]
+    binary_labels = labels  # alias for clarity — used only in diagnostics
+
+    if verbose:
+        print(f"[1] Split: {len(train_idx)} train / {len(test_idx)} test")
+
+    # ------------------------------------------------------------------
+    # Step 2 — Unsupervised model -> anomaly scores (score_guided only)
+    # ------------------------------------------------------------------
+    if strategy == "score_guided":
+        if verbose:
+            print("[2] Training unsupervised model (score_guided)...")
+        unsup_model = unsup_model_cls(random_state=random_state, device=device, verbose=0)
+        unsup_model.fit(X_train)
+        unsup_scores = unsup_model.decision_function(X_train)  # higher = more anomalous
+        if verbose:
+            print(f"    Scores range: [{unsup_scores.min():.4f}, {unsup_scores.max():.4f}]")
+    else:
+        unsup_scores = np.zeros(len(train_idx))  # unused placeholder
+        if verbose:
+            print(f"[2] Skipping unsupervised model (strategy='{strategy}' does not use scores).")
+
+    # ------------------------------------------------------------------
+    # Step 3+4 — Sample selection + LLM annotation (or load from file)
+    # ------------------------------------------------------------------
+    if load_labels_from is not None:
+        # Ablation mode: reuse existing LLM labels, skip annotation entirely
+        if verbose:
+            print(f"[3] Loading LLM labels from {load_labels_from} (seed={random_state})...")
+        labels_df = pd.read_csv(load_labels_from)
+
+        # If a model tag is specified, filter to only run_ids produced by that model.
+        # The companion metrics CSV (same dir, same name without _llm_labels suffix)
+        # is used to resolve which run_ids correspond to the requested model.
+        if load_labels_model is not None:
+            metrics_path = load_labels_from.replace("_llm_labels.csv", ".csv")
+            if not os.path.exists(metrics_path):
+                raise FileNotFoundError(
+                    f"--load_labels_model requires a companion metrics CSV at {metrics_path}"
+                )
+            metrics_df = pd.read_csv(metrics_path)
+            model_run_ids = metrics_df[
+                metrics_df["llm_model"].str.contains(load_labels_model, case=False, na=False)
+            ]["run_id"].unique()
+            if len(model_run_ids) == 0:
+                raise ValueError(
+                    f"No runs found for model tag '{load_labels_model}' in {metrics_path}. "
+                    f"Available llm_model values: {metrics_df['llm_model'].unique().tolist()}"
+                )
+            if verbose:
+                print(f"    Model filter '{load_labels_model}': {len(model_run_ids)} matching run_id(s).")
+            labels_df = labels_df[labels_df["run_id"].isin(model_run_ids)]
+
+        seed_rows = labels_df[labels_df["seed"] == random_state].reset_index(drop=True)
+        if len(seed_rows) == 0:
+            raise ValueError(f"No rows with seed={random_state} found in {load_labels_from}")
+
+        # Match loaded texts to train_idx via text lookup
+        loaded_texts = seed_rows["text"].values
+        loaded_llm_scores = seed_rows["llm_score"].values.astype(float)
+        loaded_llm_labels = seed_rows["llm_label"].values.astype(int)
+
+        # Find local indices in texts_train that match the loaded texts
+        text_to_local = {t: i for i, t in enumerate(texts_train)}
+        matched_local_idx, matched_llm_scores, matched_llm_labels = [], [], []
+        for t, sc, lb in zip(loaded_texts, loaded_llm_scores, loaded_llm_labels):
+            if t in text_to_local:
+                matched_local_idx.append(text_to_local[t])
+                matched_llm_scores.append(sc)
+                matched_llm_labels.append(lb)
+
+        if len(matched_local_idx) == 0:
+            raise ValueError(
+                f"No matching texts found between loaded labels and current train split. "
+                f"Ensure the same seed is used for the train/test split."
+            )
+
+        selected_local_idx = np.array(matched_local_idx)
+        selected_texts = texts_train[selected_local_idx]
+        llm_scores = np.array(matched_llm_scores)
+        llm_labels = np.array(matched_llm_labels)
+        # llm_results placeholder for llm_labels_df construction below
+        llm_results = [{"reason": "loaded", "parse_error": False, "truncated": False}] * len(selected_local_idx)
+
+        valid_mask = llm_labels >= 0
+        n_valid = valid_mask.sum()
+        n_anomalies = (llm_labels[valid_mask] == 1).sum()
+        n_normals = (llm_labels[valid_mask] == 0).sum()
+        n_errors = (~valid_mask).sum()
+
+        if verbose:
+            print(f"    Loaded {len(selected_local_idx)} labels (matched). "
+                  f"Valid: {n_valid} | Anomalies: {n_anomalies} | Normals: {n_normals}")
+    else:
+        # Normal mode: select samples and query LLM
+        if verbose:
+            print(f"[3] Selecting {n_llm_calls} samples ({strategy})...")
+        selected_local_idx = select_samples(
+            indices=np.arange(len(train_idx)),
+            scores=unsup_scores,
+            n=n_llm_calls,
+            strategy=strategy,
+            random_state=random_state,
+            embeddings=X_train,
+        )
+        selected_texts = texts_train[selected_local_idx]
+
+        if verbose:
+            print(f"[4] Querying LLM ({annotator.backend} / {annotator.model})...")
+        _api_delay = {"groq": 8.0, "gemini": 7.0, "openai": 1.0}.get(annotator.backend, 0.0)
+        llm_results = annotator.annotate_batch(selected_texts, dataset_name, verbose=verbose, delay=_api_delay)
+
+        llm_scores = np.array([
+            r["anomaly_score"] if r["anomaly_score"] is not None else -1.0
+            for r in llm_results
+        ])
+        valid_mask = llm_scores >= 0
+        llm_labels = np.where(llm_scores >= anomaly_score_threshold, 1, 0)
+        llm_labels[~valid_mask] = -1
+
+        n_valid = valid_mask.sum()
+        n_anomalies = (llm_labels[valid_mask] == 1).sum()
+        n_normals = (llm_labels[valid_mask] == 0).sum()
+        n_errors = (~valid_mask).sum()
+
+        if verbose:
+            print(f"    Valid: {n_valid} | Anomalies: {n_anomalies} | Normals: {n_normals} | Errors: {n_errors}")
+
+    if n_anomalies < min_anomalies_required:
+        warnings.warn(
+            f"Only {n_anomalies} anomaly samples labeled by LLM "
+            f"(min required: {min_anomalies_required}). "
+            f"Results may be unreliable."
+        )
+    anomaly_rate = n_anomalies / max(1, n_valid)
+    if anomaly_rate > 0.5:
+        warnings.warn(
+            f"LLM labeled {n_anomalies}/{n_valid} ({anomaly_rate:.0%}) as anomaly — suspiciously high. "
+            f"The LLM may have ignored the prompt (check backend/model format)."
+        )
+
+    # Keep only valid-labeled samples for training
+    train_mask = valid_mask
+    sf_texts = selected_texts[train_mask].tolist()
+    sf_labels = llm_labels[train_mask].tolist()
+
+    # ------------------------------------------------------------------
+    # Step 6 — SetFit fine-tuning on LLM labels
+    # ------------------------------------------------------------------
+    n_anomalies_sf = sf_labels.count(1)
+    n_normals_sf = sf_labels.count(0)
+    n_classes = len(set(sf_labels))
+    min_per_class = 8  # SetFit paper recommends >= 8 shots per class for stable results
+
+    setfit_skipped = no_setfit or n_classes < 2 or n_anomalies_sf < min_per_class or n_normals_sf < min_per_class
+
+    if setfit_skipped:
+        warnings.warn(
+            f"SetFit skipped: LLM produced {n_anomalies_sf} anomalies and {n_normals_sf} normals "
+            f"(need >= {min_per_class} per class). "
+            f"Using original embeddings for DeepSAD. "
+            f"Try increasing --n_llm_calls or using score_guided strategy."
+        )
+        X_train_sf = embeddings[train_idx]
+        X_test_sf = embeddings[test_idx]
+    else:
+        # Balance for SetFit: subsample majority class so contrastive pairs are meaningful.
+        # DeepSAD uses ALL labeled samples (not balanced) — handled below.
+        n_per_class_setfit = min(n_anomalies_sf, n_normals_sf)
+        rng = np.random.default_rng(random_state)
+
+        anomaly_idx = [i for i, l in enumerate(sf_labels) if l == 1]
+        normal_idx  = [i for i, l in enumerate(sf_labels) if l == 0]
+        sel_anomaly = rng.choice(anomaly_idx, size=n_per_class_setfit, replace=False).tolist()
+        sel_normal  = rng.choice(normal_idx,  size=n_per_class_setfit, replace=False).tolist()
+        balanced_idx = sel_anomaly + sel_normal
+
+        sf_texts_bal = [sf_texts[i] for i in balanced_idx]
+        sf_labels_bal = [sf_labels[i] for i in balanced_idx]
+
+        if verbose:
+            print(f"[5] Fine-tuning SetFit: {n_per_class_setfit}×2 balanced samples "
+                  f"(from {n_anomalies_sf} anomalies / {n_normals_sf} normals)...")
+
+        setfit_model = SetFitModel.from_pretrained(setfit_model_name)
+        train_dataset = HFDataset.from_dict({"text": sf_texts_bal, "label": sf_labels_bal})
+
+        trainer = SetFitTrainer(
+            model=setfit_model,
+            train_dataset=train_dataset,
+            num_iterations=10,
+            num_epochs=1,
+            batch_size=4,
+            seed=random_state,
+        )
+        trainer.train()
+
+        # ------------------------------------------------------------------
+        # Step 7 — Re-encode with SetFit embeddings
+        # ------------------------------------------------------------------
+        if verbose:
+            print("[6] Re-encoding with SetFit embeddings...")
+        encode_fn = trainer.model.model_body.encode
+        X_train_sf = encode_fn(texts_train.tolist(), show_progress_bar=False)
+        X_test_sf = encode_fn(texts_test.tolist(), show_progress_bar=False)
+
+    # Build supervised training set for DeepSAD — uses ALL valid LLM-labeled samples
+    # (not the balanced subset used for SetFit — DeepSAD handles imbalance natively)
+    labeled_local_idx = selected_local_idx[train_mask]
+    X_sup = X_train_sf[labeled_local_idx]
+    y_sup = np.array(sf_labels)  # all valid labels, may be imbalanced
+
+    # ------------------------------------------------------------------
+    # Step 8 — Semi-supervised AD model
+    # ------------------------------------------------------------------
+    if verbose:
+        print(f"[7] Training semi-supervised model with {len(y_sup)} LLM labels...")
+    semisup_model = semisup_model_cls(random_state=random_state, device=device, verbose=0)
+    semisup_model.fit(X_sup, y_sup)
+
+    # ------------------------------------------------------------------
+    # Step 9 — Evaluate on test set (ground-truth labels used here only)
+    # ------------------------------------------------------------------
+    test_scores = semisup_model.decision_function(X_test_sf)
+    train_scores = semisup_model.decision_function(X_train_sf)
+
+    # ------------------------------------------------------------------
+    # Diagnostic: LLM label agreement with ground truth
+    # (ground truth used only for logging — not for training)
+    # ------------------------------------------------------------------
+    gt_all      = binary_labels[train_idx][selected_local_idx]     # all N (for DataFrame)
+    gt_selected = gt_all[train_mask]                               # valid only (for metrics)
+    llm_pred    = np.array(sf_labels)
+    n_agree     = int((gt_selected == llm_pred).sum())
+    n_disagree  = int((gt_selected != llm_pred).sum())
+    llm_precision = float((llm_pred[gt_selected == 1] == 1).sum()) / max(1, int((llm_pred == 1).sum()))
+    llm_recall    = float((llm_pred[gt_selected == 1] == 1).sum()) / max(1, int((gt_selected == 1).sum()))
+    llm_agreement = n_agree / max(1, len(gt_selected))
+
+    if verbose:
+        print(f"    LLM vs ground truth: {n_agree}/{len(gt_selected)} correct "
+              f"(agreement={llm_agreement:.1%}, precision={llm_precision:.1%}, recall={llm_recall:.1%})")
+
+    llm_labels_df = pd.DataFrame({
+        "dataset": dataset_name,
+        "strategy": strategy,
+        "n_llm_calls": n_llm_calls,
+        "seed": random_state,
+        "text": selected_texts,
+        "ground_truth": gt_all,
+        "llm_score": llm_scores,
+        "llm_label": llm_labels,
+        "reason": [r["reason"] for r in llm_results],
+        "parse_error": [r["parse_error"] for r in llm_results],
+        "truncated": [r.get("truncated", False) for r in llm_results],
+    })
+
+    # ------------------------------------------------------------------
+    # Diagnostic: separation ratio before and after SetFit
+    # (uses GT labels only for diagnostic purposes — not for training)
+    # ------------------------------------------------------------------
+    from utils.metrics import separation_ratio
+    y_train_gt = binary_labels[train_idx]
+    sep_before = separation_ratio(X_train,    y_train_gt)
+    sep_after  = separation_ratio(X_train_sf, y_train_gt)
+
+    if verbose:
+        print(f"    Separation ratio: {sep_before:.4f} (distiluse) → {sep_after:.4f} (SetFit)")
+
+    if verbose:
+        print("[8] Done. Returning test scores for evaluation.")
+
+    return {
+        "test_scores"     : test_scores,
+        "train_scores"    : train_scores,
+        "train_labels"    : binary_labels[train_idx],
+        "X_test_sf"       : X_test_sf,
+        "test_idx"        : test_idx,
+        "n_llm_labeled"   : n_valid,
+        "n_anomalies_found": int(n_anomalies),
+        "n_normals_found" : int(n_normals),
+        "n_parse_errors"  : int(n_errors),
+        "setfit_skipped"  : setfit_skipped,
+        "strategy"        : strategy,
+        "n_llm_calls"     : n_llm_calls,
+        "dataset"         : dataset_name,
+        "llm_agreement"   : round(llm_agreement, 4),
+        "llm_precision"   : round(llm_precision, 4),
+        "llm_recall"      : round(llm_recall, 4),
+        "llm_labels_df"   : llm_labels_df,
+        "sep_ratio_before": round(float(sep_before), 4),
+        "sep_ratio_after" : round(float(sep_after),  4),
+    }
