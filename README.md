@@ -27,7 +27,7 @@ Semi-supervised text anomaly detection achieves strong performance — but only 
 
 | Dataset | Best unsup. AUC | Ours (MLP + Qwen 14B) | Oracle (GT labels) | Gap recovered |
 |---|---|---|---|---|
-| 20 Newsgroups | 0.920 | **0.967** | 0.998 | 60% |
+| 20 Newsgroups (EN) | 0.920 | **0.967** | 0.998 | 60% |
 | WikiNews (PT) | 0.751 | **0.885** | 0.943 | 70% |
 | HS Tweets (EN) | 0.575 | **0.867** | 0.946 | 79% |
 | HateBR (PT) | 0.561 | **0.742** | 0.886 | 56% |
