@@ -606,6 +606,7 @@ def run_llm_active_loop(
     load_labels_from: Optional[str] = None,
     load_labels_model: Optional[str] = None,
     no_setfit: bool = False,
+    reencoder: Optional[str] = None,
 ) -> dict:
     """
     Full LLM-guided anomaly detection pipeline (no human labels used in training).
@@ -647,6 +648,10 @@ def run_llm_active_loop(
             If None, all rows matching `random_state` are used (old behaviour).
         no_setfit: If True, skip SetFit fine-tuning and use the original pre-computed
             embeddings directly for the semi-supervised model.
+        reencoder: If set (a SentenceTransformer model name), re-encode train+test
+            with this model WITHOUT fine-tuning, replacing the pre-computed embeddings.
+            Intended for use with no_setfit=True to isolate backbone contribution
+            from contrastive fine-tuning (v9 ablation).
 
     Returns:
         dict with keys:
@@ -839,8 +844,16 @@ def run_llm_active_loop(
             f"Using original embeddings for DeepSAD. "
             f"Try increasing --n_llm_calls or using score_guided strategy."
         )
-        X_train_sf = embeddings[train_idx]
-        X_test_sf = embeddings[test_idx]
+        if reencoder is not None:
+            if verbose:
+                print(f"[5] Re-encoding with pretrained encoder (no fine-tuning): {reencoder}")
+            from sentence_transformers import SentenceTransformer
+            _enc = SentenceTransformer(reencoder)
+            X_train_sf = _enc.encode(texts_train.tolist(), show_progress_bar=False, convert_to_numpy=True)
+            X_test_sf  = _enc.encode(texts_test.tolist(),  show_progress_bar=False, convert_to_numpy=True)
+        else:
+            X_train_sf = embeddings[train_idx]
+            X_test_sf = embeddings[test_idx]
     else:
         # Balance for SetFit: subsample majority class so contrastive pairs are meaningful.
         # DeepSAD uses ALL labeled samples (not balanced) — handled below.

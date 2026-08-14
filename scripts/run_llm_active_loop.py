@@ -109,7 +109,7 @@ def parse_args():
     )
     # Selection strategy
     parser.add_argument(
-        "--strategy", type=str, default="score_guided",
+        "--strategy", type=str, default="random",
         choices=["random", "score_guided", "diversity"],
         help="Sample selection strategy for LLM annotation budget.",
     )
@@ -130,6 +130,15 @@ def parse_args():
         "--setfit_model", type=str,
         default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         help="SetFit base model for contrastive fine-tuning.",
+    )
+    parser.add_argument(
+        "--reencoder", type=str, default=None,
+        help=(
+            "When set, re-encodes train+test with this SentenceTransformer model "
+            "WITHOUT fine-tuning, replacing the pre-computed embeddings. "
+            "Use with --no_setfit to isolate backbone contribution (v9 ablation). "
+            "Example: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'"
+        ),
     )
     # Semi-supervised model
     parser.add_argument(
@@ -369,6 +378,7 @@ def main():
         load_labels_from=args.load_labels_from,
         load_labels_model=args.load_labels_model,
         no_setfit=args.no_setfit,
+        reencoder=args.reencoder,
     )
 
     # ------------------------------------------------------------------
